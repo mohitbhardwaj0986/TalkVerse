@@ -40,97 +40,75 @@ const setupSocketServer = (httpServer) => {
 
   io.on("connection", (socket) => {
 
-    socket.on("ai-message", async (messagePayload) => {
-      try {
-        // 1. Save user message
-        
-        
-        const message = await Message.create({
-          chat: messagePayload.chat,
-          user: socket.user._id,
-          content: messagePayload.content,
-          role: "user",
-        });
-        
-        // 2. Generate vector & query memory
-        const vectors = await generateVector(messagePayload.content);
-        const memory = await quaryMemory({
-          quaryVector: vectors,
-          limit: 3,
-          metadata: { user: socket.user._id },
-        });
-        
-        
-        // 3. Save user message to memory
-        await createMemory({
-          vectors,
-          messageId: message._id,
-          metadata: {
-            chat: messagePayload.chat,
-            user: socket.user._id,
-            text: message.content,
-          },
-        });
-        
-        // 4. Load recent chat history
-        const chatHistory = (
-          await Message.find({ chat: messagePayload.chat })
-          .sort({ createdAt: -1 })
-          .limit(20)
-          .lean()
-        ).reverse();
-        
-        const stm = chatHistory.map((item) => ({
-          role: item.role,
-          parts: [{ text: item.content }],
-        }));
-        
-        const ltm = [
-          {
-            role: "user",
-            parts: [
-              {
-                text: `These are some previous messages from the chat. Use them to generate a response:\n\n${memory
-                .map((item) => item.metadata.text)
-                .join("\n")}`,
-              },
-            ],
-          },
-        ];
-        
-        // 5. Generate AI response
-        const response = await generateResponse([...ltm, ...stm]);
-        
-        // 6. Save AI response
-        const responseMessage = await Message.create({
-          chat: messagePayload.chat,
-          user: socket.user._id,
-          content: response,
-          role: "model",
-        });
-        
-        const responseVectors = await generateVector(response);
-        await createMemory({
-          vectors: responseVectors,
-          messageId: responseMessage._id,
-          metadata: {
-            chat: messagePayload.chat,
-            user: socket.user._id,
-            text: response,
-          },
-        });
-        
+   socket.on("ai-message", async (messagePayload) => {
+  try {
+    // Save msg + generate vectors + fetch history in parallel
+    const [message, vectors, chatHistory] = await Promise.all([
+      Message.create({
+        chat: messagePayload.chat,
+        user: socket.user._id,
+        content: messagePayload.content,
+        role: "user",
+      }),
+      generateVector(messagePayload.content),
+      Message.find({ chat: messagePayload.chat })
+        .sort({ createdAt: -1 })
+        .limit(10) // limit tighter
+        .lean(),
+    ]);
 
-        // 7. Send response to client
-        socket.emit("ai-response", {
-          content: response,
-          chat: messagePayload.chat,
-        });
-      } catch (error) {
-        console.error("❌ Error handling ai-message:", error.message);
-        socket.emit("ai-error", { error: "Failed to process your request." });
-      }
+    // Query memory in parallel (non-blocking)
+    const memoryPromise = quaryMemory({
+      quaryVector: vectors,
+      limit: 3,
+      metadata: { user: socket.user._id },
     });
+
+    // Prepare chat history
+    const stm = chatHistory.reverse().map((item) => ({
+      role: item.role,
+      parts: [{ text: item.content }],
+    }));
+
+    // Get memory results
+    const memory = await memoryPromise;
+
+    const ltm = memory.length
+      ? [{
+          role: "user",
+          parts: [{
+            text: `Relevant past context:\n\n${memory.map((m) => m.metadata.text).join("\n")}`,
+          }],
+        }]
+      : [];
+
+    // AI response (main bottleneck)
+    const response = await generateResponse([...ltm, ...stm]);
+
+    // Save + send response
+    const responseMessage = await Message.create({
+      chat: messagePayload.chat,
+      user: socket.user._id,
+      content: response,
+      role: "model",
+    });
+
+    socket.emit("ai-response", { content: response, chat: messagePayload.chat });
+
+    // Fire-and-forget background vector saves
+    Promise.all([
+      createMemory({ vectors, messageId: message._id, metadata: { chat: messagePayload.chat, user: socket.user._id, text: message.content } }),
+      generateVector(response).then((respVectors) =>
+        createMemory({ vectors: respVectors, messageId: responseMessage._id, metadata: { chat: messagePayload.chat, user: socket.user._id, text: response } })
+      ),
+    ]).catch(console.error);
+
+  } catch (error) {
+    console.error("❌ Error handling ai-message:", error.message);
+    socket.emit("ai-error", { error: "Failed to process your request." });
+  }
+});
+
 
     socket.on("disconnect", () => {
       console.log(`⚡ User disconnected: ${socket.user.email}`);
